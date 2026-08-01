@@ -11,6 +11,16 @@ import {
   parseOpticalFrame,
   raptorPacketKey,
 } from "@/lib/optical-transfer";
+import {
+  decryptSecrets,
+  isEncryptedVault,
+  VAULT_MIME,
+} from "@/lib/secrets-crypto";
+import {
+  bytesToSecrets,
+  SecretEntry,
+  serializeEnv,
+} from "@/lib/secrets-format";
 
 type ScanState =
   | "idle"
@@ -124,6 +134,13 @@ export function ScannerClient() {
     decodeP50: 0,
     decodeP95: 0,
   });
+  const [vaultBytes, setVaultBytes] = useState<Uint8Array | null>(null);
+  const [vaultSecrets, setVaultSecrets] = useState<SecretEntry[] | null>(null);
+  const [vaultPassphrase, setVaultPassphrase] = useState("");
+  const [vaultError, setVaultError] = useState("");
+  const [vaultDecrypting, setVaultDecrypting] = useState(false);
+  const [revealedKeys, setRevealedKeys] = useState<Set<string>>(new Set());
+  const [showVaultPassphrase, setShowVaultPassphrase] = useState(false);
 
   const stopCamera = useCallback(() => {
     scanningRef.current = false;
@@ -169,19 +186,34 @@ export function ScannerClient() {
           throw new Error("The recovered file checksum did not match.");
         }
 
+        setFileMeta(recovered.meta);
+        setProgress(1);
+        setState("complete");
+        stopCamera();
+        navigator.vibrate?.([80, 40, 120]);
+
+        if (recovered.meta.mime === VAULT_MIME) {
+          setVaultBytes(bytes);
+          setVaultSecrets(null);
+          setVaultPassphrase("");
+          setVaultError("");
+          setRevealedKeys(new Set());
+          setGuidance(
+            isEncryptedVault(bytes)
+              ? "Vault recovered. Enter the passphrase to reveal secrets."
+              : "Unencrypted vault recovered. Secrets are ready to review.",
+          );
+          return;
+        }
+
         const fileBytes = Uint8Array.from(bytes);
         const url = URL.createObjectURL(
           new Blob([fileBytes.buffer], { type: recovered.meta.mime }),
         );
         if (downloadUrlRef.current) URL.revokeObjectURL(downloadUrlRef.current);
         downloadUrlRef.current = url;
-        setFileMeta(recovered.meta);
         setDownloadUrl(url);
-        setProgress(1);
         setGuidance("File decompressed and checksum verified. It is safe to save.");
-        setState("complete");
-        stopCamera();
-        navigator.vibrate?.([80, 40, 120]);
       } catch (cause) {
         setState("error");
         setError(
@@ -507,6 +539,13 @@ export function ScannerClient() {
       decodeP50: 0,
       decodeP95: 0,
     });
+    setVaultBytes(null);
+    setVaultSecrets(null);
+    setVaultPassphrase("");
+    setVaultError("");
+    setVaultDecrypting(false);
+    setRevealedKeys(new Set());
+    setShowVaultPassphrase(false);
     if (downloadUrlRef.current) {
       URL.revokeObjectURL(downloadUrlRef.current);
       downloadUrlRef.current = "";
@@ -617,7 +656,76 @@ export function ScannerClient() {
     };
   }, [stopCamera]);
 
+  useEffect(() => {
+    if (!vaultBytes || isEncryptedVault(vaultBytes) || vaultSecrets) return;
+    try {
+      setVaultSecrets(bytesToSecrets(vaultBytes));
+      setVaultError("");
+    } catch (cause) {
+      setVaultError(
+        cause instanceof Error
+          ? cause.message
+          : "The vault payload could not be decoded.",
+      );
+    }
+  }, [vaultBytes, vaultSecrets]);
+
+  const unlockVault = async () => {
+    if (!vaultBytes) return;
+    setVaultDecrypting(true);
+    setVaultError("");
+    try {
+      const plaintext = await decryptSecrets(vaultBytes, vaultPassphrase);
+      setVaultSecrets(bytesToSecrets(plaintext));
+      setRevealedKeys(new Set());
+      setGuidance("Vault unlocked. Review secrets carefully before copying.");
+    } catch (cause) {
+      setVaultSecrets(null);
+      setVaultError(
+        cause instanceof Error
+          ? cause.message
+          : "The vault could not be decrypted.",
+      );
+    } finally {
+      setVaultDecrypting(false);
+    }
+  };
+
+  const copyText = async (value: string) => {
+    try {
+      await navigator.clipboard?.writeText(value);
+    } catch {
+      setVaultError("Clipboard access failed. Copy manually or use HTTPS.");
+    }
+  };
+
+  const clearVaultSecrets = () => {
+    setVaultPassphrase("");
+    setVaultError("");
+    setRevealedKeys(new Set());
+    setGuidance("Secrets cleared from this screen.");
+    if (vaultBytes && isEncryptedVault(vaultBytes)) {
+      setVaultSecrets(null);
+    } else {
+      setVaultSecrets([]);
+    }
+  };
+
+  const downloadEnv = () => {
+    if (!vaultSecrets) return;
+    const text = serializeEnv(vaultSecrets);
+    const url = URL.createObjectURL(
+      new Blob([text], { type: "text/plain;charset=utf-8" }),
+    );
+    const anchor = document.createElement("a");
+    anchor.href = url;
+    anchor.download = fileMeta?.filename || "qrvault.env";
+    anchor.click();
+    URL.revokeObjectURL(url);
+  };
+
   const complete = state === "complete";
+  const vaultComplete = complete && vaultBytes !== null;
   const active =
     state === "scanning" || state === "receiving" || state === "starting";
   const compressionRatio =
@@ -649,13 +757,23 @@ export function ScannerClient() {
     <main className="scanner-page">
       <section className="scanner-intro">
         <p className="eyebrow">RAPTORQ MOBILE RECEIVER</p>
-        <h1>{complete ? "File recovered." : "Point. Hold. Receive."}</h1>
+        <h1>
+          {vaultComplete
+            ? "Vault recovered."
+            : complete
+              ? "File recovered."
+              : "Point. Hold. Receive."}
+        </h1>
         <p>
-          {complete
-            ? "The RaptorQ object and original file both passed end-to-end checksums."
-            : scanMode === "dual"
-              ? "Dual-lane scanning reads two alternating 30 fps channels; either stable lane can advance the file."
-              : "A native-speed scanner reads one raw-binary QR per exposure; missed frames do not matter."}
+          {vaultComplete
+            ? vaultSecrets
+              ? "Secrets verified. Reveal only what you need, then clear the screen."
+              : "The optical payload passed checksums. Unlock with the sender passphrase."
+            : complete
+              ? "The RaptorQ object and original file both passed end-to-end checksums."
+              : scanMode === "dual"
+                ? "Dual-lane scanning reads two alternating 30 fps channels; either stable lane can advance the file."
+                : "A native-speed scanner reads one raw-binary QR per exposure; missed frames do not matter."}
         </p>
       </section>
 
@@ -827,7 +945,139 @@ export function ScannerClient() {
 
           {error ? <p className="error-message" role="alert">{error}</p> : null}
 
-          {complete && downloadUrl && fileMeta ? (
+          {vaultComplete ? (
+            <div className="secrets-output">
+              {vaultBytes && isEncryptedVault(vaultBytes) && !vaultSecrets ? (
+                <div className="vault-decrypt-gate">
+                  <label>
+                    Vault passphrase
+                    <div className="vault-passphrase-row">
+                      <input
+                        type={showVaultPassphrase ? "text" : "password"}
+                        value={vaultPassphrase}
+                        onChange={(event) =>
+                          setVaultPassphrase(event.target.value)
+                        }
+                        autoComplete="current-password"
+                        disabled={vaultDecrypting}
+                      />
+                      <button
+                        type="button"
+                        className="secret-reveal-btn"
+                        onClick={() =>
+                          setShowVaultPassphrase((current) => !current)
+                        }
+                      >
+                        {showVaultPassphrase ? "Hide" : "Show"}
+                      </button>
+                    </div>
+                  </label>
+                  <button
+                    className="primary-action"
+                    type="button"
+                    disabled={!vaultPassphrase || vaultDecrypting}
+                    onClick={() => void unlockVault()}
+                  >
+                    <span aria-hidden="true">
+                      {vaultDecrypting ? "…" : "⊘"}
+                    </span>
+                    {vaultDecrypting ? "Decrypting…" : "Unlock secrets"}
+                  </button>
+                </div>
+              ) : null}
+
+              {vaultSecrets && vaultSecrets.length > 0 ? (
+                <>
+                  <table className="secrets-table">
+                    <thead>
+                      <tr>
+                        <th scope="col">Key</th>
+                        <th scope="col">Value</th>
+                        <th scope="col">Actions</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {vaultSecrets.map((entry) => {
+                        const revealed = revealedKeys.has(entry.key);
+                        return (
+                          <tr key={entry.key}>
+                            <td>
+                              <code>{entry.key}</code>
+                            </td>
+                            <td>
+                              <code>
+                                {revealed ? entry.value : "••••••••"}
+                              </code>
+                            </td>
+                            <td>
+                              <button
+                                type="button"
+                                className="secret-reveal-btn"
+                                onClick={() =>
+                                  setRevealedKeys((current) => {
+                                    const next = new Set(current);
+                                    if (next.has(entry.key)) next.delete(entry.key);
+                                    else next.add(entry.key);
+                                    return next;
+                                  })
+                                }
+                              >
+                                {revealed ? "Hide" : "Reveal"}
+                              </button>
+                              <button
+                                type="button"
+                                className="secret-reveal-btn"
+                                onClick={() => void copyText(entry.value)}
+                              >
+                                Copy
+                              </button>
+                            </td>
+                          </tr>
+                        );
+                      })}
+                    </tbody>
+                  </table>
+                  <div className="secrets-actions">
+                    <button
+                      type="button"
+                      className="link-action"
+                      onClick={() => void copyText(serializeEnv(vaultSecrets))}
+                    >
+                      Copy all as .env
+                    </button>
+                    <button
+                      type="button"
+                      className="link-action"
+                      onClick={downloadEnv}
+                    >
+                      Download .env
+                    </button>
+                    <button
+                      type="button"
+                      className="link-action"
+                      onClick={clearVaultSecrets}
+                    >
+                      Clear secrets
+                    </button>
+                  </div>
+                </>
+              ) : null}
+
+              {vaultSecrets && vaultSecrets.length === 0 ? (
+                <p className="scan-hint">Secrets cleared from this screen.</p>
+              ) : null}
+
+              {vaultError ? (
+                <p className="error-message" role="alert">
+                  {vaultError}
+                </p>
+              ) : null}
+
+              <button className="link-action" type="button" onClick={startCamera}>
+                Scan another transfer
+              </button>
+            </div>
+          ) : complete && downloadUrl && fileMeta ? (
             <a className="primary-action" href={downloadUrl} download={fileMeta.filename}>
               <span aria-hidden="true">↓</span>
               Save {fileMeta.filename}
@@ -852,7 +1102,7 @@ export function ScannerClient() {
             </button>
           )}
 
-          {complete ? (
+          {complete && !vaultComplete ? (
             <button className="link-action" type="button" onClick={startCamera}>
               Scan another transfer
             </button>
