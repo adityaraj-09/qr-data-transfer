@@ -54,3 +54,17 @@ test("server-renders the mobile scanner surface", async () => {
   assert.match(html, /decode p50 \/ p95/i);
   assert.match(html, /one raw-binary QR per exposure|Dual-lane scanning/);
 });
+
+test("server-renders the vault secrets surface", async () => {
+  const response = await render("/vault");
+  assert.equal(response.status, 200);
+
+  const html = await response.text();
+  assert.match(html, /<title>Vault · QRFerry<\/title>/i);
+  assert.match(html, /Move secrets/);
+  assert.match(html, /Collect secrets/);
+  assert.match(html, /Encrypt &amp; Stream|Encrypt & Stream/);
+  assert.match(html, /AES-GCM-256/);
+  assert.match(html, /PBKDF2 200k/);
+  assert.match(html, /No encryption/);
+});

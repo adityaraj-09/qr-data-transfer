@@ -1,6 +1,6 @@
 import Link from "next/link";
 
-export function AppHeader({ active }: { active: "send" | "scan" }) {
+export function AppHeader({ active }: { active: "send" | "scan" | "vault" }) {
   return (
     <header className="site-header">
       <Link className="wordmark" href="/" aria-label="QRFerry home">
@@ -15,6 +15,9 @@ export function AppHeader({ active }: { active: "send" | "scan" }) {
       <nav className="mode-switch" aria-label="Transfer mode">
         <Link className={active === "send" ? "active" : ""} href="/">
           Send
+        </Link>
+        <Link className={active === "vault" ? "active" : ""} href="/vault">
+          Vault
         </Link>
         <Link className={active === "scan" ? "active" : ""} href="/scan">
           Scan

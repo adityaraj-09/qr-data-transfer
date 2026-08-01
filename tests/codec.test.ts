@@ -20,6 +20,19 @@ import {
   parseOpticalFrame,
   raptorPacketKey,
 } from "../lib/optical-transfer";
+import {
+  decryptSecrets,
+  encryptSecrets,
+  isEncryptedVault,
+  passphraseStrength,
+  VAULT_MIME,
+} from "../lib/secrets-crypto";
+import {
+  bytesToSecrets,
+  parseEnv,
+  secretsToBytes,
+  serializeEnv,
+} from "../lib/secrets-format";
 import { TRANSFER_PRESETS } from "../lib/transfer-presets";
 
 const require = createRequire(import.meta.url);
@@ -339,6 +352,104 @@ test("ZXing recovers two noisy side-by-side Turbo lanes in one exposure", async 
     ),
     "the unchanged lane should survive a rolling-shutter transition in its neighbor",
   );
+});
+
+test("env parser and serializer preserve keys, quotes, and comments", () => {
+  const text = [
+    "# staging",
+    "API_KEY=plain",
+    'DATABASE_URL="postgres://user:pass@host/db"',
+    "export TOKEN='abc=def'",
+    "",
+    "BAD KEY=nope",
+    "EMPTY=",
+  ].join("\n");
+  const secrets = parseEnv(text);
+  assert.deepEqual(secrets, [
+    { key: "API_KEY", value: "plain" },
+    { key: "DATABASE_URL", value: "postgres://user:pass@host/db" },
+    { key: "TOKEN", value: "abc=def" },
+    { key: "EMPTY", value: "" },
+  ]);
+  const roundTrip = parseEnv(serializeEnv(secrets));
+  assert.deepEqual(roundTrip, secrets);
+});
+
+test("secrets byte codec validates JSON shape", () => {
+  const secrets = [
+    { key: "OPENAI_API_KEY", value: "sk-test" },
+    { key: "DB_PASSWORD", value: "s3cret" },
+  ];
+  const bytes = secretsToBytes(secrets);
+  assert.deepEqual(bytesToSecrets(bytes), secrets);
+  assert.throws(
+    () => bytesToSecrets(new TextEncoder().encode('{"no":"array"}')),
+    /array/i,
+  );
+  assert.throws(
+    () => bytesToSecrets(new TextEncoder().encode('[{"key":1,"value":"x"}]')),
+    /invalid secret/i,
+  );
+});
+
+test("vault crypto round-trips and rejects wrong passphrases", async () => {
+  const secrets = [{ key: "SERVICE_TOKEN", value: "rotate-me-now" }];
+  const plaintext = secretsToBytes(secrets);
+  const encrypted = await encryptSecrets(plaintext, "correct horse battery");
+  assert.equal(isEncryptedVault(encrypted), true);
+  assert.equal(isEncryptedVault(plaintext), false);
+
+  const unlocked = await decryptSecrets(encrypted, "correct horse battery");
+  assert.deepEqual(bytesToSecrets(unlocked), secrets);
+  await assert.rejects(
+    () => decryptSecrets(encrypted, "wrong passphrase"),
+    /Wrong passphrase|corrupted/i,
+  );
+  assert.equal(passphraseStrength("short").level, "weak");
+  assert.ok(passphraseStrength("correct horse battery staple").bits >= 40);
+});
+
+test("encrypted vault survives the optical compress + RaptorQ pipeline", async () => {
+  prepareRaptorQ();
+  const secrets = [
+    { key: "API_KEY", value: "sk-live-" + "x".repeat(48) },
+    { key: "DATABASE_URL", value: "postgres://vault:pass@db/prod" },
+  ];
+  const encrypted = await encryptSecrets(
+    secretsToBytes(secrets),
+    "vault-passphrase-strong-enough",
+  );
+  const compressed = await compressForTransfer(encrypted);
+  const prepared = buildOpticalContainer(encrypted, compressed.bytes, {
+    filename: "qrvault.env",
+    mime: VAULT_MIME,
+    compression: compressed.mode,
+  });
+  assert.equal(prepared.meta.mime, VAULT_MIME);
+
+  const transfer = await createOpticalTransfer(prepared, {
+    symbolSize: TRANSFER_PRESETS.robust.symbolSize,
+    repairPercent: TRANSFER_PRESETS.robust.repairPercent,
+  });
+  const decoder = await RaptorQWasmDecoder.create(
+    transfer.containerLength,
+    transfer.symbolSize,
+  );
+  let decoded: Uint8Array | null = null;
+  for (const packet of transfer.packets) {
+    decoded = decoder.push(parseOpticalFrame(packet).payload);
+    if (decoded) break;
+  }
+  assert.ok(decoded);
+  const recovered = parseOpticalContainer(decoded);
+  const payload = await decompressTransfer(
+    recovered.transmitted,
+    recovered.meta.compression,
+  );
+  assert.equal(crc32(payload), recovered.meta.fileCrc);
+  assert.equal(recovered.meta.mime, VAULT_MIME);
+  const unlocked = await decryptSecrets(payload, "vault-passphrase-strong-enough");
+  assert.deepEqual(bytesToSecrets(unlocked), secrets);
 });
 
 test("all profiles fit exactly and expose increasing high-speed channels", () => {
