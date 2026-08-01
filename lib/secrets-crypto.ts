@@ -20,6 +20,13 @@ function getRandomBytes(length: number) {
   return bytes;
 }
 
+/** Copy into a detached ArrayBuffer so Web Crypto BufferSource typing accepts it. */
+function toArrayBuffer(bytes: Uint8Array): ArrayBuffer {
+  const copy = new ArrayBuffer(bytes.byteLength);
+  new Uint8Array(copy).set(bytes);
+  return copy;
+}
+
 async function deriveKey(passphrase: string, salt: Uint8Array) {
   const crypto = requireCrypto();
   const material = await crypto.subtle.importKey(
@@ -32,7 +39,7 @@ async function deriveKey(passphrase: string, salt: Uint8Array) {
   return crypto.subtle.deriveKey(
     {
       name: "PBKDF2",
-      salt,
+      salt: toArrayBuffer(salt),
       iterations: PBKDF2_ITERATIONS,
       hash: "SHA-256",
     },
@@ -64,7 +71,11 @@ export async function encryptSecrets(
   const iv = getRandomBytes(IV_BYTES);
   const key = await deriveKey(passphrase, salt);
   const ciphertext = new Uint8Array(
-    await crypto.subtle.encrypt({ name: "AES-GCM", iv }, key, plaintext),
+    await crypto.subtle.encrypt(
+      { name: "AES-GCM", iv: toArrayBuffer(iv) },
+      key,
+      toArrayBuffer(plaintext),
+    ),
   );
 
   const output = new Uint8Array(HEADER_BYTES + ciphertext.length);
@@ -98,7 +109,11 @@ export async function decryptSecrets(
 
   try {
     return new Uint8Array(
-      await crypto.subtle.decrypt({ name: "AES-GCM", iv }, key, ciphertext),
+      await crypto.subtle.decrypt(
+        { name: "AES-GCM", iv: toArrayBuffer(iv) },
+        key,
+        toArrayBuffer(ciphertext),
+      ),
     );
   } catch {
     throw new Error("Wrong passphrase, or the vault payload is corrupted.");
